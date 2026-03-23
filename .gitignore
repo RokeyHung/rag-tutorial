@@ -34,5 +34,6 @@ pip-wheel-metadata/
 
 # Local runtime/output data
 chroma_data/
+data_source/generative_ai/
 logs/
 *.log
