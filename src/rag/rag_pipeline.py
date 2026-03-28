@@ -19,8 +19,42 @@ class FocusedAnswerParser(StrOutputParser):
         return answer
 
 
+def _u_shape_reorder(docs):
+    # Doc1 Doc2 Doc3 Doc4 Doc5 -> Doc1 Doc3 Doc5 Doc4 Doc2
+    odds = docs[0::2]
+    evens = docs[1::2][::-1]
+    return odds + evens
+
+
+def _doc_citation_label(doc) -> str:
+    meta = dict(getattr(doc, "metadata", {}) or {})
+    course = meta.get("course_name") or meta.get("course") or ""
+    lecture = meta.get("lecture_name") or ""
+    slide = meta.get("slide_file") or ""
+    page = meta.get("page_number")
+    if page is None:
+        try:
+            page = int(meta.get("page", 0)) + 1
+        except Exception:
+            page = 1
+    return f"{course}|{lecture}|{slide}|p{int(page)}"
+
+
 def format_docs(docs):
-    return "\n\n".join(doc.page_content for doc in docs)
+    docs = _u_shape_reorder(list(docs))
+    blocks = []
+    seen = set()
+    for doc in docs:
+        content = (getattr(doc, "page_content", "") or "").strip()
+        if not content:
+            continue
+        # tránh nhồi trùng nội dung y hệt
+        if content in seen:
+            continue
+        seen.add(content)
+        label = _doc_citation_label(doc)
+        blocks.append(f"[{label}]\n{content}")
+    return "\n\n".join(blocks)
 
 
 class OfflineRAG:
@@ -31,7 +65,11 @@ class OfflineRAG:
         self.prompt = PromptTemplate.from_template("""
 Bạn là trợ lý AI.
 
-Chỉ sử dụng thông tin trong context để trả lời.
+Chỉ sử dụng thông tin trong context để trả lời. Nếu context không có thông tin, hãy trả lời đúng nguyên văn: "Không có thông tin".
+
+Yêu cầu:
+- Trả lời ngắn gọn.
+- Mỗi ý quan trọng phải kèm trích dẫn nguồn theo định dạng [course|lecture|slide|pX] lấy từ nhãn trong context.
 
 Context:
 {context}

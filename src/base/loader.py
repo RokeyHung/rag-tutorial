@@ -21,6 +21,18 @@ def clean_vietnamese_text(text: str) -> str:
     return text.strip()
 
 
+def slugify(text: str) -> str:
+    """
+    Tạo slug ổn định cho ID (không dấu, lowercase, chỉ a-z0-9 và '-').
+    """
+    text = unicodedata.normalize("NFKD", text)
+    text = "".join(ch for ch in text if not unicodedata.combining(ch))
+    text = text.lower()
+    text = re.sub(r"[^a-z0-9]+", "-", text)
+    text = re.sub(r"-{2,}", "-", text).strip("-")
+    return text or "unknown"
+
+
 @dataclass
 class CoursePdfStats:
     """Thống kê một môn (một thư mục con)."""
@@ -76,11 +88,50 @@ def format_pdf_courses_report(result: PdfCoursesLoadResult) -> str:
 
 
 class SimpleLoader:
+    def _apply_location_metadata(
+        self,
+        doc,
+        *,
+        course_name: str | None,
+        lecture_name: str | None,
+        slide_path: str,
+    ) -> None:
+        meta = dict(getattr(doc, "metadata", {}) or {})
+
+        page0 = meta.get("page", 0)
+        try:
+            page_number = int(page0) + 1  # 1-based
+        except Exception:
+            page_number = 1
+
+        slide_file = Path(slide_path).name
+
+        if course_name is not None:
+            meta["course_name"] = course_name
+            meta.setdefault("course", course_name)  # backward-compat
+        if lecture_name is not None:
+            meta["lecture_name"] = lecture_name
+            if course_name is not None:
+                meta["lecture_id"] = f"{slugify(course_name)}__{slugify(lecture_name)}"
+
+        meta["slide_file"] = slide_file
+        meta["slide_path"] = slide_path
+        meta.setdefault("source", slide_path)  # backward-compat
+        meta["page_number"] = page_number
+
+        doc.metadata = meta
+
     def load_pdf(self, pdf_file: str):
         docs = PyPDFLoader(pdf_file).load()
 
         for doc in docs:
             doc.page_content = clean_vietnamese_text(doc.page_content)
+            self._apply_location_metadata(
+                doc,
+                course_name=None,
+                lecture_name=None,
+                slide_path=str(pdf_file),
+            )
 
         return docs
 
@@ -141,9 +192,14 @@ class SimpleLoader:
                 try:
                     docs = self.load_pdf(str(pdf_file))
                     for doc in docs:
-                        doc.metadata = dict(doc.metadata)
-                        doc.metadata["course"] = name
-                        doc.metadata["source"] = str(pdf_file)
+                        rel = pdf_file.relative_to(course_path)
+                        lecture_part = rel.parts[0] if len(rel.parts) > 1 else "default"
+                        self._apply_location_metadata(
+                            doc,
+                            course_name=name,
+                            lecture_name=lecture_part,
+                            slide_path=str(pdf_file),
+                        )
                     course_docs.extend(docs)
                 except Exception:
                     pass

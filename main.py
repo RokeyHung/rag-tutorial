@@ -1,13 +1,14 @@
 import os
+import json
 from pathlib import Path
 
 from dotenv import load_dotenv
 
+from src.base.env import env_bool, env_int, env_str
 from src.base.loader import SimpleLoader, format_pdf_courses_report
 from src.base.splitter import TextSplitter
-from src.rag.llm import get_hf_llm
-from src.rag.rag_pipeline import OfflineRAG
 from src.rag.vector_db import (
+    RAG_SCHEMA_VERSION,
     VectorDB,
     chroma_collection_document_count,
     clear_vector_store_dir,
@@ -18,18 +19,24 @@ from src.rag.vector_db import (
 
 
 load_dotenv()
-DATA_DIR = os.getenv("DATA_DIR", "data_source/pdf")
+DATA_DIR = env_str("DATA_DIR", "data_source/pdf") or "data_source/pdf"
 
 
 def main():
-    persist_dir = os.getenv("CHROMA_PERSIST_DIR", "./chroma_data")
-    collection_name = os.getenv("CHROMA_COLLECTION_NAME", "vietnamese_docs")
-    embedding_model = os.getenv(
+    persist_dir = env_str("CHROMA_PERSIST_DIR", "./chroma_data") or "./chroma_data"
+    collection_name = env_str("CHROMA_COLLECTION_NAME", "vietnamese_docs") or "vietnamese_docs"
+    embedding_model = env_str(
         "EMBEDDING_MODEL_NAME",
         "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
-    )
+    ) or "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
     data_dir_resolved = str(Path(DATA_DIR).resolve())
-    rebuild = os.getenv("REBUILD_VECTOR_DB", "").lower() in ("1", "true", "yes")
+    rebuild = env_bool("REBUILD_VECTOR_DB", False)
+    top_k = env_int("TOP_K", 5, min_value=1, max_value=50)
+    use_llm = env_bool("RAG_USE_LLM", True)
+    search_strategy = env_str("RAG_SEARCH_STRATEGY", "similarity") or "similarity"
+    rerank_enable = env_bool("RAG_RERANK_ENABLE", False)
+    rerank_model = env_str("RAG_RERANK_MODEL", "cross-encoder/ms-marco-MiniLM-L-6-v2") or "cross-encoder/ms-marco-MiniLM-L-6-v2"
+    rerank_top_n = env_int("RAG_RERANK_TOP_N", 50, min_value=1, max_value=200)
 
     if rebuild:
         print("🧹 REBUILD_VECTOR_DB: xóa index cũ trong", persist_dir)
@@ -45,6 +52,7 @@ def main():
             embedding_model=embedding_model,
             data_dir_resolved=data_dir_resolved,
             collection_name=collection_name,
+            schema_version=RAG_SCHEMA_VERSION,
         )
     )
 
@@ -75,19 +83,23 @@ def main():
         write_rag_manifest(
             persist_dir,
             {
+                "schema_version": RAG_SCHEMA_VERSION,
                 "embedding_model": embedding_model,
                 "data_dir": data_dir_resolved,
                 "collection_name": collection_name,
             },
         )
 
-    retriever = vectordb.get_retriever()
+    rag = None
+    if use_llm:
+        from src.rag.llm import get_hf_llm
+        from src.rag.rag_pipeline import OfflineRAG
 
-    print("🤖 Loading LLM...")
-    llm = get_hf_llm()
-
-    print("🔗 Building RAG...")
-    rag = OfflineRAG(retriever, llm)
+        retriever = vectordb.get_retriever()
+        print("🤖 Loading LLM...")
+        llm = get_hf_llm()
+        print("🔗 Building RAG...")
+        rag = OfflineRAG(retriever, llm)
 
     print("\n✅ Ready!")
 
@@ -96,8 +108,21 @@ def main():
         if query == "exit":
             break
 
-        answer = rag.ask(query)
-        print("\n💡 Answer:", answer)
+        hits = vectordb.search_locations(
+            query,
+            k=top_k,
+            dedupe_by_page=True,
+            strategy=search_strategy,
+            rerank_enable=rerank_enable,
+            rerank_model_name=rerank_model,
+            rerank_top_n=rerank_top_n,
+        )
+        print("\n📌 Locations:")
+        print(json.dumps(hits, ensure_ascii=False, indent=2))
+
+        if rag is not None:
+            answer = rag.ask(query)
+            print("\n💡 Answer:", answer)
 
 
 if __name__ == "__main__":
