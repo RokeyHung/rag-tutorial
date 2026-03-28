@@ -1,5 +1,6 @@
 import os
 import json
+import sys
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -23,6 +24,15 @@ DATA_DIR = env_str("DATA_DIR", "data_source/pdf") or "data_source/pdf"
 
 
 def main():
+    # Tránh crash khi console Windows không phải UTF-8 (emoji/tiếng Việt).
+    try:
+        if hasattr(sys.stdout, "reconfigure"):
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        if hasattr(sys.stderr, "reconfigure"):
+            sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
     persist_dir = env_str("CHROMA_PERSIST_DIR", "./chroma_data") or "./chroma_data"
     collection_name = env_str("CHROMA_COLLECTION_NAME", "vietnamese_docs") or "vietnamese_docs"
     embedding_model = env_str(
@@ -38,31 +48,40 @@ def main():
     rerank_model = env_str("RAG_RERANK_MODEL", "cross-encoder/ms-marco-MiniLM-L-6-v2") or "cross-encoder/ms-marco-MiniLM-L-6-v2"
     rerank_top_n = env_int("RAG_RERANK_TOP_N", 50, min_value=1, max_value=200)
 
-    if rebuild:
-        print("🧹 REBUILD_VECTOR_DB: xóa index cũ trong", persist_dir)
-        clear_vector_store_dir(persist_dir)
-
     manifest = read_rag_manifest(persist_dir)
     count = chroma_collection_document_count(persist_dir, collection_name)
-    reuse_index = (
-        not rebuild
-        and count > 0
-        and rag_manifest_matches(
-            manifest,
-            embedding_model=embedding_model,
-            data_dir_resolved=data_dir_resolved,
-            collection_name=collection_name,
-            schema_version=RAG_SCHEMA_VERSION,
-        )
+    manifest_ok = rag_manifest_matches(
+        manifest,
+        embedding_model=embedding_model,
+        data_dir_resolved=data_dir_resolved,
+        collection_name=collection_name,
+        schema_version=RAG_SCHEMA_VERSION,
     )
 
-    if reuse_index:
+    if not rebuild:
+        # Khi REBUILD_VECTOR_DB=false: KHÔNG tự động rebuild để tránh việc start là load PDF lại.
+        if count <= 0:
+            raise RuntimeError(
+                "Vector DB chưa tồn tại hoặc đang rỗng. "
+                "Hãy đặt REBUILD_VECTOR_DB=1 để build index lần đầu."
+            )
+        if not manifest_ok:
+            raise RuntimeError(
+                "Vector DB hiện có không khớp cấu hình hiện tại "
+                "(DATA_DIR/EMBEDDING_MODEL_NAME/CHROMA_COLLECTION_NAME/schema). "
+                "Hãy đặt REBUILD_VECTOR_DB=1 để rebuild."
+            )
+
         print(f"📂 Dùng vector DB đã lưu ({count} chunk) — bỏ qua nạp PDF và embedding lại.")
-        vectordb = VectorDB(documents=None)
+        vectordb = VectorDB(
+            documents=None,
+            embedding_model=embedding_model,
+            collection_name=collection_name,
+            persist_dir=persist_dir,
+        )
     else:
-        if not rebuild and count > 0:
-            print("🧹 Cấu hình DATA_DIR / embedding / collection đổi — xây lại index.")
-            clear_vector_store_dir(persist_dir)
+        print("🧹 REBUILD_VECTOR_DB=1: xóa index cũ trong", persist_dir)
+        clear_vector_store_dir(persist_dir)
 
         print("🚀 Loading documents...")
         loader = SimpleLoader()
@@ -79,7 +98,12 @@ def main():
         chunks = splitter.split(docs)
 
         print("🧠 Building vector DB...")
-        vectordb = VectorDB(documents=chunks)
+        vectordb = VectorDB(
+            documents=chunks,
+            embedding_model=embedding_model,
+            collection_name=collection_name,
+            persist_dir=persist_dir,
+        )
         write_rag_manifest(
             persist_dir,
             {

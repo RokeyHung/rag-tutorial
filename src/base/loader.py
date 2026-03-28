@@ -48,6 +48,8 @@ class PdfCoursesLoadResult:
     courses: List[CoursePdfStats] = field(default_factory=list)
     """Thư mục môn có nhưng không có file .pdf (bị bỏ qua khi index)."""
     skipped_no_pdf: List[str] = field(default_factory=list)
+    """Danh sách file PDF lỗi khi parse (để debug)."""
+    failed_pdfs: List[str] = field(default_factory=list)
 
     @property
     def num_courses(self) -> int:
@@ -70,6 +72,7 @@ def format_pdf_courses_report(result: PdfCoursesLoadResult) -> str:
         f"Số môn đã nạp được (có file .pdf): {result.num_courses}",
         f"Số file PDF đã nạp: {result.total_pdf_files}",
         f"Tổng số trang (slide): {result.total_slides}",
+        f"Số file PDF lỗi khi đọc: {len(result.failed_pdfs)}",
         "",
         "Chi tiết từng môn:",
     ]
@@ -84,10 +87,22 @@ def format_pdf_courses_report(result: PdfCoursesLoadResult) -> str:
         )
         for name in sorted(result.skipped_no_pdf):
             lines.append(f"  ⊗ {name}")
+
+    if result.failed_pdfs:
+        lines.append("")
+        lines.append("PDF bị lỗi khi đọc (hiển thị tối đa 10 file):")
+        for p in result.failed_pdfs[:10]:
+            lines.append(f"  ! {p}")
+        if len(result.failed_pdfs) > 10:
+            lines.append(f"  … và {len(result.failed_pdfs) - 10} file khác")
     return "\n".join(lines)
 
 
 class SimpleLoader:
+    def _looks_like_pdf(self, path: str | Path) -> bool:
+        p = Path(path)
+        return p.suffix.lower() == ".pdf"
+
     def _apply_location_metadata(
         self,
         doc,
@@ -139,7 +154,7 @@ class SimpleLoader:
         import glob
         from tqdm import tqdm
 
-        pdf_files = glob.glob(f"{dir_path}/*.pdf")
+        pdf_files = [p for p in glob.glob(f"{dir_path}/*.pdf") if self._looks_like_pdf(p)]
 
         if not pdf_files:
             raise ValueError(f"No PDF files found in {dir_path}")
@@ -149,8 +164,8 @@ class SimpleLoader:
         for pdf_file in tqdm(pdf_files, desc="Loading PDFs"):
             try:
                 all_docs.extend(self.load_pdf(pdf_file))
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"⚠️ Lỗi đọc PDF: {pdf_file} | {type(e).__name__}: {e}")
 
         return all_docs
 
@@ -178,9 +193,14 @@ class SimpleLoader:
             name = course_path.name
 
             if recursive:
-                pdf_files = sorted(course_path.rglob("*.pdf"))
+                candidates = sorted(course_path.rglob("*.pdf"))
             else:
-                pdf_files = sorted(course_path.glob("*.pdf"))
+                candidates = sorted(course_path.glob("*.pdf"))
+
+            pdf_files = [p for p in candidates if self._looks_like_pdf(p)]
+            non_pdf_like = [p for p in candidates if not self._looks_like_pdf(p)]
+            for p in non_pdf_like:
+                result.failed_pdfs.append(f"{p} | ValueError: File không có đuôi .pdf (ví dụ .ppdf) — hãy đổi tên đúng")
 
             if not pdf_files:
                 result.skipped_no_pdf.append(name)
@@ -201,8 +221,8 @@ class SimpleLoader:
                             slide_path=str(pdf_file),
                         )
                     course_docs.extend(docs)
-                except Exception:
-                    pass
+                except Exception as e:
+                    result.failed_pdfs.append(f"{pdf_file} | {type(e).__name__}: {e}")
 
             if not course_docs and pdf_files:
                 # Có file nhưng đọc hỏng — vẫn ghi nhận môn với 0 trang
