@@ -1,6 +1,69 @@
+import json
 import os
+import shutil
+from pathlib import Path
+
+import chromadb
 from langchain_chroma import Chroma
 from langchain_huggingface import HuggingFaceEmbeddings
+
+RAG_MANIFEST_NAME = ".rag_manifest.json"
+
+
+def chroma_collection_document_count(persist_dir: str, collection_name: str) -> int:
+    """Số chunk/document trong collection đã persist (0 nếu chưa có)."""
+    if not os.path.isdir(persist_dir):
+        return 0
+    try:
+        client = chromadb.PersistentClient(path=persist_dir)
+        col = client.get_collection(name=collection_name)
+        return int(col.count())
+    except Exception:
+        return 0
+
+
+def rag_manifest_path(persist_dir: str) -> Path:
+    return Path(persist_dir) / RAG_MANIFEST_NAME
+
+
+def read_rag_manifest(persist_dir: str) -> dict | None:
+    path = rag_manifest_path(persist_dir)
+    if not path.is_file():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def write_rag_manifest(persist_dir: str, payload: dict) -> None:
+    Path(persist_dir).mkdir(parents=True, exist_ok=True)
+    rag_manifest_path(persist_dir).write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def rag_manifest_matches(
+    manifest: dict | None,
+    *,
+    embedding_model: str,
+    data_dir_resolved: str,
+    collection_name: str,
+) -> bool:
+    """Index cũ không có manifest vẫn được coi là dùng được (tương thích ngược)."""
+    if manifest is None:
+        return True
+    return (
+        manifest.get("embedding_model") == embedding_model
+        and manifest.get("data_dir") == data_dir_resolved
+        and manifest.get("collection_name") == collection_name
+    )
+
+
+def clear_vector_store_dir(persist_dir: str) -> None:
+    if os.path.isdir(persist_dir):
+        shutil.rmtree(persist_dir)
 
 
 class VectorDB:
