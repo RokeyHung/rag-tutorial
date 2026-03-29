@@ -35,6 +35,10 @@ pip-wheel-metadata/
 # Local runtime/output data
 chroma_data/
 data_source/
+data_source/
+!data_source/
+data_source/*
+!data_source/notes.txt
 data_source.zip
 data_source.rar
 logs/
