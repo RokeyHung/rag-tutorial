@@ -2,6 +2,7 @@ import json
 import os
 import shutil
 import inspect
+import stat
 import time
 from pathlib import Path
 
@@ -17,12 +18,67 @@ def chroma_collection_document_count(persist_dir: str, collection_name: str) -> 
     """Số chunk/document trong collection đã persist (0 nếu chưa có)."""
     if not os.path.isdir(persist_dir):
         return 0
+    client = None
     try:
         client = chromadb.PersistentClient(path=persist_dir)
         col = client.get_collection(name=collection_name)
         return int(col.count())
     except Exception:
         return 0
+    finally:
+        # Quan trọng: phải đóng client đúng cách.
+        # Không gọi client._system.stop() vì sẽ làm SharedSystemClient giữ System ở trạng thái "stopped"
+        # và lần tạo client tiếp theo trong cùng process có thể gặp lỗi RustBindingsAPI không có bindings.
+        try:
+            close = getattr(client, "close", None) if client is not None else None
+            if callable(close):
+                close()
+        except Exception:
+            pass
+
+
+def _is_windows() -> bool:
+    return os.name == "nt"
+
+
+def _win_schedule_delete_on_reboot(path: str) -> bool:
+    """Windows-only: cố gắng lên lịch xoá path khi reboot (MoveFileExW)."""
+    if not _is_windows():
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        MOVEFILE_DELAY_UNTIL_REBOOT = 0x00000004
+        MoveFileExW = ctypes.windll.kernel32.MoveFileExW
+        MoveFileExW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD]
+        MoveFileExW.restype = wintypes.BOOL
+        return bool(MoveFileExW(str(path), None, MOVEFILE_DELAY_UNTIL_REBOOT))
+    except Exception:
+        return False
+
+
+def _win_schedule_tree_delete_on_reboot(root: str) -> bool:
+    """Windows-only: lên lịch xoá toàn bộ cây thư mục khi reboot (best-effort)."""
+    if not _is_windows():
+        return False
+    root_path = Path(root)
+    if not root_path.exists():
+        return True
+
+    scheduled_any = False
+    try:
+        # Xoá từ lá lên gốc để tăng khả năng xoá thư mục rỗng sau reboot.
+        items = list(root_path.rglob("*"))
+        items.sort(key=lambda p: len(p.parts), reverse=True)
+        for p in items:
+            if _win_schedule_delete_on_reboot(str(p)):
+                scheduled_any = True
+        if _win_schedule_delete_on_reboot(str(root_path)):
+            scheduled_any = True
+    except Exception:
+        pass
+    return scheduled_any
 
 
 def rag_manifest_path(persist_dir: str) -> Path:
@@ -69,13 +125,54 @@ def rag_manifest_matches(
 def clear_vector_store_dir(persist_dir: str) -> None:
     if os.path.isdir(persist_dir):
         last_err: Exception | None = None
+        scheduled_on_reboot = False
+
+        def _onerror(func, path, exc_info):
+            nonlocal last_err, scheduled_on_reboot
+            exc = exc_info[1]
+            last_err = exc
+
+            # Thử bỏ readonly rồi retry lại thao tác delete/rmdir.
+            try:
+                os.chmod(path, stat.S_IWRITE)
+            except Exception:
+                pass
+
+            try:
+                func(path)
+                return
+            except Exception as e2:
+                last_err = e2
+
+            # Nếu bị lock (WinError 32) / access denied (WinError 5), best-effort:
+            # lên lịch xoá khi reboot để người dùng “force remove” được.
+            winerror = getattr(last_err, "winerror", None)
+            if _is_windows() and winerror in (32, 5):
+                if _win_schedule_delete_on_reboot(path):
+                    scheduled_on_reboot = True
+                    return
+
+            raise
+
         for attempt in range(6):
             try:
-                shutil.rmtree(persist_dir)
+                shutil.rmtree(persist_dir, onerror=_onerror)
                 return
-            except PermissionError as e:
+            except Exception as e:
                 last_err = e
+                winerror = getattr(e, "winerror", None)
+                if _is_windows() and winerror in (32, 5):
+                    if _win_schedule_tree_delete_on_reboot(persist_dir):
+                        scheduled_on_reboot = True
                 time.sleep(0.3 * (2**attempt))
+
+        if scheduled_on_reboot and _is_windows():
+            raise PermissionError(
+                f"Không thể xóa ngay thư mục vector store '{persist_dir}' vì đang bị tiến trình khác sử dụng. "
+                "Mình đã cố gắng lên lịch xóa khi Windows reboot. "
+                "Hãy restart máy rồi chạy lại REBUILD_VECTOR_DB=1."
+            ) from last_err
+
         raise PermissionError(
             f"Không thể xóa thư mục vector store '{persist_dir}' vì file đang bị tiến trình khác sử dụng "
             "(thường là chroma.sqlite3 trên Windows). "

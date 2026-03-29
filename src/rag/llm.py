@@ -81,6 +81,8 @@ def _build_hf_pipeline_cached(
     temperature: float,
     max_new_tokens: int,
     top_p: float,
+    repetition_penalty: float,
+    no_repeat_ngram_size: int,
 ):
     cuda_available = torch.cuda.is_available()
     torch_cuda_version = getattr(getattr(torch, "version", None), "cuda", None)
@@ -125,22 +127,52 @@ def _build_hf_pipeline_cached(
         model_kwargs["device_map"] = "auto"
         using_device_map = True
 
-    model = AutoModelForCausalLM.from_pretrained(model_name, **model_kwargs)
+    # Ưu tiên load từ local cache trước; nếu không có thì tự tải.
+    model = None
+    try:
+        model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            local_files_only=True,
+            **model_kwargs,
+        )
+    except Exception:
+        model = None
+    if model is None:
+        print(f"⬇️ Không tìm thấy model local, đang tải: {model_name}")
+        model = AutoModelForCausalLM.from_pretrained(model_name, **model_kwargs)
     if not using_device_map:
         model = model.to(device)
     model.eval()
 
-    tokenizer = AutoTokenizer.from_pretrained(model_name, token=hf_token, use_fast=True)
+    tokenizer = None
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_name,
+            token=hf_token,
+            use_fast=True,
+            local_files_only=True,
+        )
+    except Exception:
+        tokenizer = None
+    if tokenizer is None:
+        print(f"⬇️ Không tìm thấy tokenizer local, đang tải: {model_name}")
+        tokenizer = AutoTokenizer.from_pretrained(model_name, token=hf_token, use_fast=True)
     if getattr(tokenizer, "pad_token_id", None) is None and getattr(tokenizer, "eos_token_id", None) is not None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    # Đặt generation config trên model để tránh warning "generation_config + args" của pipeline.
+    # Đặt generation config trực tiếp trên model để:
+    # - áp dụng mặc định cho mọi lần gọi (LangChain wrapper không truyền pipeline_kwargs khi invoke)
+    # - tăng chất lượng (giảm lặp) và tránh bị cắt do max_new_tokens mặc định thấp.
     try:
         gen = model.generation_config
         gen.do_sample = True
         gen.temperature = float(temperature)
         gen.top_p = float(top_p)
         gen.max_new_tokens = int(max_new_tokens)
+        if hasattr(gen, "repetition_penalty"):
+            gen.repetition_penalty = float(repetition_penalty)
+        if hasattr(gen, "no_repeat_ngram_size"):
+            gen.no_repeat_ngram_size = int(no_repeat_ngram_size)
         if getattr(gen, "pad_token_id", None) is None and getattr(tokenizer, "pad_token_id", None) is not None:
             gen.pad_token_id = tokenizer.pad_token_id
         if getattr(gen, "eos_token_id", None) is None and getattr(tokenizer, "eos_token_id", None) is not None:
@@ -161,12 +193,17 @@ def _build_hf_pipeline_cached(
         f"accelerate={accelerate_ok}",
         f"device_map={'auto' if using_device_map else 'none'}",
         f"dtype={str(dtype).replace('torch.', '')}",
+        f"max_new_tokens={int(max_new_tokens)}",
+        f"temperature={float(temperature)}",
+        f"top_p={float(top_p)}",
     )
 
     pipe_kwargs = dict(
         task="text-generation",
         model=model,
         tokenizer=tokenizer,
+        # Không trả lại phần prompt, giúp parser sạch hơn
+        return_full_text=False,
     )
 
     # Nếu model đã được shard/placed qua device_map, không set device cho pipeline (tránh xung đột).
@@ -179,7 +216,7 @@ def _build_hf_pipeline_cached(
 def get_hf_llm(
     model_name: str | None = None,
     temperature: float = 0.2,
-    max_new_tokens: int = 300,
+    max_new_tokens: int = 512,
 ):
     model_name = model_name or os.getenv("LLM_MODEL_NAME", "Qwen/Qwen2.5-3B-Instruct")
     hf_token = os.getenv("HF_TOKEN")
@@ -187,12 +224,39 @@ def get_hf_llm(
     device_pref = _parse_device_pref(os.getenv("LLM_DEVICE", "auto"))
     dtype_pref = _parse_dtype_pref(os.getenv("LLM_DTYPE", "auto"))
 
+    # Cho phép tinh chỉnh generation qua env (không bắt buộc).
+    temp_raw = os.getenv("LLM_TEMPERATURE", "")
+    if temp_raw.strip() != "":
+        try:
+            temperature = float(temp_raw)
+        except Exception:
+            pass
+
+    mnt_raw = os.getenv("LLM_MAX_NEW_TOKENS", "")
+    if mnt_raw.strip() != "":
+        try:
+            max_new_tokens = int(float(mnt_raw))
+        except Exception:
+            pass
+
     # Cho phép override top_p qua env, nhưng vẫn giữ API hiện tại.
     top_p_raw = os.getenv("LLM_TOP_P", "")
     try:
         top_p = float(top_p_raw) if top_p_raw.strip() != "" else 0.75
     except Exception:
         top_p = 0.75
+
+    rep_raw = os.getenv("LLM_REPETITION_PENALTY", "")
+    try:
+        repetition_penalty = float(rep_raw) if rep_raw.strip() != "" else 1.12
+    except Exception:
+        repetition_penalty = 1.12
+
+    ngram_raw = os.getenv("LLM_NO_REPEAT_NGRAM", "")
+    try:
+        no_repeat_ngram_size = int(float(ngram_raw)) if ngram_raw.strip() != "" else 4
+    except Exception:
+        no_repeat_ngram_size = 4
 
     pipe = _build_hf_pipeline_cached(
         model_name=model_name,
@@ -202,6 +266,8 @@ def get_hf_llm(
         temperature=temperature,
         max_new_tokens=max_new_tokens,
         top_p=top_p,
+        repetition_penalty=repetition_penalty,
+        no_repeat_ngram_size=no_repeat_ngram_size,
     )
 
     return HuggingFacePipeline(pipeline=pipe)

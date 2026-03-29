@@ -48,15 +48,21 @@ def main():
     rerank_model = env_str("RAG_RERANK_MODEL", "cross-encoder/ms-marco-MiniLM-L-6-v2") or "cross-encoder/ms-marco-MiniLM-L-6-v2"
     rerank_top_n = env_int("RAG_RERANK_TOP_N", 50, min_value=1, max_value=200)
 
-    manifest = read_rag_manifest(persist_dir)
-    count = chroma_collection_document_count(persist_dir, collection_name)
-    manifest_ok = rag_manifest_matches(
-        manifest,
-        embedding_model=embedding_model,
-        data_dir_resolved=data_dir_resolved,
-        collection_name=collection_name,
-        schema_version=RAG_SCHEMA_VERSION,
-    )
+    # Quan trọng (Windows): nếu REBUILD_VECTOR_DB=1 thì đừng mở PersistentClient để đếm/đọc collection trước,
+    # tránh self-lock khiến bước xoá chroma_data bị WinError 32.
+    manifest = None
+    count = 0
+    manifest_ok = False
+    if not rebuild:
+        manifest = read_rag_manifest(persist_dir)
+        count = chroma_collection_document_count(persist_dir, collection_name)
+        manifest_ok = rag_manifest_matches(
+            manifest,
+            embedding_model=embedding_model,
+            data_dir_resolved=data_dir_resolved,
+            collection_name=collection_name,
+            schema_version=RAG_SCHEMA_VERSION,
+        )
 
     if not rebuild:
         # Khi REBUILD_VECTOR_DB=false: KHÔNG tự động rebuild để tránh việc start là load PDF lại.

@@ -13,8 +13,10 @@ class FocusedAnswerParser(StrOutputParser):
         else:
             answer = text
 
-        answer = re.sub(r"^\s*[\-\*]\s*", "", answer, flags=re.MULTILINE)
-        answer = re.sub(r"\n+", " ", answer)
+        # Chuẩn hoá nhẹ để in ra gọn, vẫn giữ xuống dòng để dễ đọc + giữ citations.
+        answer = re.sub(r"[ \t]+\n", "\n", answer)
+        answer = re.sub(r"\n{3,}", "\n\n", answer)
+        answer = answer.strip()
 
         return answer
 
@@ -57,6 +59,36 @@ def format_docs(docs):
     return "\n\n".join(blocks)
 
 
+def format_docs_with_source_ids(docs):
+    """
+    Trả về (context_text, id_to_label).
+
+    Ý tưởng: ép model chỉ được cite [S1], [S2]... (dễ kiểm soát),
+    rồi map lại sang nhãn thật [course|lecture|slide|pX] để nguồn luôn chính xác.
+    """
+    docs = _u_shape_reorder(list(docs))
+    blocks = []
+    seen = set()
+    id_to_label: dict[str, str] = {}
+    i = 0
+
+    for doc in docs:
+        content = (getattr(doc, "page_content", "") or "").strip()
+        if not content:
+            continue
+        if content in seen:
+            continue
+        seen.add(content)
+
+        i += 1
+        sid = f"S{i}"
+        label = _doc_citation_label(doc)
+        id_to_label[sid] = label
+        blocks.append(f"[{sid}] [{label}]\n{content}")
+
+    return ("\n\n".join(blocks), id_to_label)
+
+
 class OfflineRAG:
     def __init__(self, retriever, llm):
         self.retriever = retriever
@@ -68,8 +100,12 @@ Bạn là trợ lý AI.
 Chỉ sử dụng thông tin trong context để trả lời. Nếu context không có thông tin, hãy trả lời đúng nguyên văn: "Không có thông tin".
 
 Yêu cầu:
-- Trả lời ngắn gọn.
-- Mỗi ý quan trọng phải kèm trích dẫn nguồn theo định dạng [course|lecture|slide|pX] lấy từ nhãn trong context.
+- Trả lời rõ ràng, không lặp ý.
+- Trả lời theo gạch đầu dòng (3–7 ý) nếu phù hợp.
+- Không tự giới thiệu, không viết kiểu “trang chủ/diễn đàn/tài liệu đang tìm kiếm…”. Đi thẳng vào câu trả lời.
+- Mỗi ý quan trọng phải kèm trích dẫn nguồn.
+- Bạn CHỈ được phép trích dẫn theo dạng [S1], [S2], ... (copy y nguyên các mã S có trong context).
+- Tuyệt đối KHÔNG tự chế trích dẫn kiểu [course|...], [lecture|...], hoặc bất kỳ nhãn nào khác ngoài [S<number>].
 
 Context:
 {context}
@@ -91,4 +127,44 @@ Câu hỏi:
         )
 
     def ask(self, query: str):
-        return self.chain.invoke(query)
+        # Làm thủ công để đảm bảo citations khớp nguồn (S1..Sn -> label thật).
+        docs = list(self.retriever.invoke(query) or [])
+        context, id_to_label = format_docs_with_source_ids(docs)
+
+        prompt_text = self.prompt.format(context=context, question=query)
+        raw = self.llm.invoke(prompt_text)
+        answer = FocusedAnswerParser().parse(str(raw))
+
+        if answer.strip() == "Không có thông tin":
+            return "Không có thông tin"
+
+        # Lấy các mã nguồn model đã dùng (chỉ chấp nhận S<number>).
+        used_ids = re.findall(r"\[S(\d+)\]", answer)
+        used_sids = []
+        seen = set()
+        for n in used_ids:
+            sid = f"S{int(n)}"
+            if sid in id_to_label and sid not in seen:
+                seen.add(sid)
+                used_sids.append(sid)
+
+        # Thay [Sx] -> [course|lecture|slide|pX] để người dùng thấy nguồn thật.
+        def _replace_sid(m: re.Match) -> str:
+            n = int(m.group(1))
+            sid = f"S{n}"
+            label = id_to_label.get(sid)
+            return f"[{label}]" if label else ""
+
+        answer = re.sub(r"\[S(\d+)\]", _replace_sid, answer)
+
+        # Gỡ các bracket lạ còn sót (để tránh model tự chế nhãn khác).
+        answer = re.sub(r"\[(?![^\[\]\|]+\|[^\[\]\|]*\|[^\[\]\|]*\|p\d+\])[^\[\]]+\]", "", answer)
+        answer = FocusedAnswerParser().parse(answer)
+
+        # Append danh sách nguồn đã dùng (nếu có).
+        if used_sids:
+            src_lines = [f"- [{id_to_label[sid]}]" for sid in used_sids if sid in id_to_label]
+            if src_lines and "Nguồn:" not in answer:
+                answer = answer.rstrip() + "\n\nNguồn:\n" + "\n".join(src_lines)
+
+        return answer.strip()
